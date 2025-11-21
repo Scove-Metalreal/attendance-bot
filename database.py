@@ -105,14 +105,16 @@ def get_random_active_task():
 
 # --- Work Session Management Functions ---
 
-def start_session(user_id: int, task_id: int, guild_id: int, voice_channel_id: int):
-    """Creates a new work session when a user joins a voice channel. Returns the new session_id."""
+def start_session(user_id, task_id, guild_id, voice_channel_id, sheet_row_id=None):
+    """
+    Tạo session mới (Cập nhật thêm tham số sheet_row_id)
+    """
     sql = """
-          INSERT INTO work_sessions
-              (user_id, task_id, guild_id, voice_channel_id, join_time)
-          VALUES (%s, %s, %s, %s, NOW()) \
-          """
-    return execute_query(sql, (user_id, task_id, guild_id, voice_channel_id))
+    INSERT INTO work_sessions (user_id, task_id, guild_id, voice_channel_id, join_time, sheet_row_id)
+    VALUES (%s, %s, %s, %s, NOW(), %s)
+    """
+    # execute_query nên trả về ID của dòng vừa insert (lastrowid)
+    return execute_query(sql, (user_id, task_id, guild_id, voice_channel_id, sheet_row_id))
 
 
 def get_active_session(user_id: int):
@@ -143,9 +145,13 @@ def get_active_or_recent_session(user_id: int):
     return fetch_one(sql, (user_id,))
 
 
-def has_active_submission(session_id: int):
-    # Trả về True nếu tồn tại submission chưa verify
-    sql = "SELECT 1 FROM task_submissions WHERE session_id = %s AND is_verified = 0 LIMIT 1"
+def check_submission_exists(session_id: int):
+    """
+    Kiểm tra xem session này đã từng có submission nào chưa (Bất kể đã duyệt hay chưa).
+    Tránh lỗi Duplicate Entry.
+    """
+    # Bỏ điều kiện 'AND verified = 0' đi
+    sql = "SELECT 1 FROM task_submissions WHERE session_id = %s LIMIT 1"
     return fetch_one(sql, (session_id,)) is not None
 
 
@@ -159,6 +165,22 @@ def get_submission_code(session_id: int):
 def get_task_by_id(task_id: int):
     # Lấy thông tin task
     return fetch_one("SELECT task_name FROM tasks WHERE task_id = %s", (task_id,))
+
+
+def get_or_create_task(task_name, description):
+    """
+    Tìm task trong DB, nếu chưa có thì tạo mới. Trả về task_id.
+    """
+    # 1. Tìm kiếm
+    sql_check = "SELECT task_id FROM tasks WHERE task_name = %s"
+    res = fetch_one(sql_check, (task_name,))
+    if res:
+        return res['task_id']
+
+    # 2. Nếu chưa có -> Tạo mới
+    sql_insert = "INSERT INTO tasks (task_name, task_description, is_active) VALUES (%s, %s, 1)"
+    task_id = execute_query(sql_insert, (task_name, description))
+    return task_id
 
 def end_session(session_id: int):
     """

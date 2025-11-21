@@ -6,6 +6,7 @@ import secrets
 from dotenv import load_dotenv
 from datetime import timedelta, datetime
 import random
+import google_utils
 
 # Import our custom database module
 import database
@@ -17,195 +18,164 @@ TOKEN = os.getenv('DISCORD_TOKEN')
 # Cấu hình đường dẫn folder ảnh
 REWARD_FOLDER = "reward_images"
 
-# Lấy ID kênh target, chuyển sang int. Nếu lỗi (quên set) thì để 0 (sẽ không chạy)
+# Lấy ID kênh target Voice (Chấm công)
 TARGET_VC_ID = int(os.getenv('TARGET_VOICE_CHANNEL_ID', 0))
 
-# Configure Intents (Permissions)
+# Lấy ID kênh Log (Thông báo & Reward) - NEW
+LOG_CHANNEL_ID = int(os.getenv('LOG_CHANNEL_ID', 0))
+
+# --- MAPPING USER ---
+# ID Discord : Tên Role trong cột D của Google Sheet
+USER_MAPPING = {
+    123456789012345678: "2. Lead Programmer", # Thay ID thật của bạn
+    987654321098765432: "3. Lead Artist",
+    # Thêm các thành viên khác vào đây
+}
+
+# Configure Intents
 intents = discord.Intents.default()
-intents.message_content = True  # Required for reading messages (if needed)
-intents.voice_states = True  # REQUIRED: To track Voice Channel activity
-intents.members = True  # REQUIRED: To fetch user details
+intents.message_content = True
+intents.voice_states = True
+intents.members = True
 
 # Initialize Bot
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 
-# --- Event: Bot Ready ---
-@bot.event
-async def on_ready():
-    """Triggered when the bot successfully connects and performs self-correction."""
-    try:
-        # Sync Slash Commands with Discord
-        synced = await bot.tree.sync()
-        print(f"✅ Bot is online as {bot.user}")
-        print(f"✅ Synced {len(synced)} slash commands")
-        print("------")
-    except Exception as e:
-        print(f"❌ Failed to sync commands: {e}")
+# --- Helper: Gửi thông báo vào kênh Log ---
+async def send_to_log_channel(guild, content=None, embed=None, file=None):
+    """
+    Gửi tin nhắn vào kênh LOG_CHANNEL_ID thay vì DM.
+    Luôn tag user trong content để họ biết.
+    """
+    if LOG_CHANNEL_ID == 0:
+        print("⚠️ Chưa cấu hình LOG_CHANNEL_ID trong .env")
+        return
 
-    # --- LOGIC TỰ SỬA LỖI KHI RESTART (Chèn vào đây) ---
-    print("🔄 Checking for stale sessions...")
-
-    # Lấy tất cả session đang active trong DB
-    # (Đảm bảo database.py của bạn có hàm get_db_connection/end_session)
-    conn = database.get_db_connection()
-    cursor = conn.cursor(dictionary=True)
-
-    # Query các session đang active (leave_time IS NULL)
-    cursor.execute("SELECT session_id, user_id, guild_id FROM work_sessions WHERE leave_time IS NULL")
-    stale_sessions = cursor.fetchall()
-
-    count_fixed = 0
-    # Lấy thời gian hiện tại để dùng làm leave_time cho các session bị sửa lỗi
-    # Giả sử database.end_session tự động set leave_time = NOW() hoặc bạn cần truyền vào.
-
-    for session in stale_sessions:
-        guild = bot.get_guild(session['guild_id'])
-
-        # 1. Kiểm tra Bot có còn trong Guild đó không
-        if guild:
-            member = guild.get_member(session['user_id'])
-
-            is_in_voice = False
-            # 2. Kiểm tra Member có trong Guild và đang trong Kênh thoại không
-            if member and member.voice and member.voice.channel:
-                is_in_voice = True
-
-            # Nếu DB nói "Đang làm" VÀ thực tế "Không có trong Voice"
-            # (Hoặc member không còn trong server, hoặc không có voice state)
-            if not is_in_voice:
-                # End session ngay lập tức (Database tự tính work_duration)
-                print(
-                    f"  -> Closing stale session {session['session_id']} for user {session['user_id']} (Guild ID: {session['guild_id']})")
-
-                # Hàm end_session sẽ tính duration dựa trên start_time và thời gian hiện tại
-                database.end_session(session['session_id'])
-
-                count_fixed += 1
-            # else:
-            #   Member VẪN đang trong voice channel (đúng như DB ghi nhận). Không làm gì.
-
-    cursor.close()
-    conn.close()
-    print(f"✅ Fixed {count_fixed} stale sessions.")
-    print("----------------------------------------------------------------------")
+    channel = guild.get_channel(LOG_CHANNEL_ID)
+    if channel:
+        try:
+            await channel.send(content=content, embed=embed, file=file)
+        except Exception as e:
+            print(f"❌ Lỗi gửi tin vào Log Channel: {e}")
+    else:
+        print(f"❌ Không tìm thấy kênh Log có ID: {LOG_CHANNEL_ID}")
 
 
+# --- Helper: Lấy ảnh Random ---
 def get_random_reward_file():
-    """
-    Quét folder REWARD_FOLDER và trả về đường dẫn của 1 ảnh ngẫu nhiên.
-    Nếu folder rỗng hoặc không tồn tại, trả về None.
-    """
     if not os.path.exists(REWARD_FOLDER):
-        print(f"⚠️ Folder {REWARD_FOLDER} không tồn tại. Hãy tạo nó và thêm ảnh vào.")
         return None
-
-    # Lấy danh sách tất cả file trong folder
     files = os.listdir(REWARD_FOLDER)
-
-    # Lọc chỉ lấy file ảnh (jpg, png, gif, webp...)
     valid_extensions = ('.jpg', '.jpeg', '.png', '.gif', '.webp')
     images = [f for f in files if f.lower().endswith(valid_extensions)]
-
     if not images:
         return None
-
-    # Chọn ngẫu nhiên 1 ảnh
     selected_image = random.choice(images)
     return os.path.join(REWARD_FOLDER, selected_image)
 
-# --- Event: Voice State Update (Core Logic) ---
+
+# --- Event: Bot Ready ---
+@bot.event
+async def on_ready():
+    try:
+        synced = await bot.tree.sync()
+        print(f"✅ Bot is online as {bot.user}")
+        print(f"✅ Synced {len(synced)} slash commands")
+        print(f"🎯 Monitoring Voice Channel ID: {TARGET_VC_ID}")
+        print(f"📝 Logging to Channel ID: {LOG_CHANNEL_ID}")
+    except Exception as e:
+        print(f"❌ Failed to sync commands: {e}")
+
+    # Logic tự sửa lỗi khi restart (Giữ nguyên như cũ)
+    print("🔄 Checking for stale sessions...")
+    conn = database.get_db_connection()
+    cursor = conn.cursor(dictionary=True)
+    cursor.execute("SELECT session_id, user_id, guild_id FROM work_sessions WHERE leave_time IS NULL")
+    stale_sessions = cursor.fetchall()
+    count_fixed = 0
+    for session in stale_sessions:
+        guild = bot.get_guild(session['guild_id'])
+        if guild:
+            member = guild.get_member(session['user_id'])
+            is_in_voice = member and member.voice and member.voice.channel
+            if not is_in_voice:
+                database.end_session(session['session_id'])
+                count_fixed += 1
+    cursor.close()
+    conn.close()
+    print(f"✅ Fixed {count_fixed} stale sessions.")
+
+
+# --- Event: Voice State Update ---
 @bot.event
 async def on_voice_state_update(member, before, after):
-    # 1. Check xem Target ID đã config chưa
     if TARGET_VC_ID == 0:
-        print("⚠️ Chưa cấu hình TARGET_VOICE_CHANNEL_ID trong .env")
         return
 
     user_id = member.id
     username = member.name
     avatar_url = str(member.avatar.url) if member.avatar else None
+    guild = member.guild
 
-    # --- LOGIC LỌC KÊNH (TARGET CHANNEL FILTER) ---
-
-    # Helper: User có đang ở trong kênh Target không?
-    # True nếu kênh hiện tại trùng với Target ID
+    # Logic Lọc Kênh
     in_target_before = (before.channel is not None and before.channel.id == TARGET_VC_ID)
     in_target_after = (after.channel is not None and after.channel.id == TARGET_VC_ID)
 
-    # JOINING: Trước đó KHÔNG ở Target -> Sau đó Ở Target
     is_joining = not in_target_before and in_target_after
-
-    # LEAVING: Trước đó Ở Target -> Sau đó KHÔNG ở Target (Rời hẳn hoặc sang kênh khác)
     is_leaving = in_target_before and not in_target_after
-
-    # STAYING: Trước và Sau đều ở Target (Chỉ đổi trạng thái Mic/Loa)
     is_staying = in_target_before and in_target_after
 
     # =========================================================
-    # 1. XỬ LÝ KẾT THÚC SESSION (Rời phòng HOẶC Tắt tai nghe/mic)
+    # 1. XỬ LÝ KẾT THÚC SESSION (Giữ nguyên logic cũ)
     # =========================================================
     should_end = is_leaving or (is_staying and (after.self_deaf or after.self_mute))
 
     if should_end:
         session = database.get_active_session(user_id)
-
         if session:
             session_id = session['session_id']
             task_id = session['task_id']
 
-            # --- A. TÍNH TOÁN DURATION TẠM THỜI (Đề phòng session bị xóa) ---
+            # Tính toán duration tạm thời
             join_time = session.get('join_time')
             provisional_duration = 0
             if join_time and isinstance(join_time, datetime):
-                time_difference = datetime.now() - join_time
-                provisional_duration = int(time_difference.total_seconds())
+                provisional_duration = int((datetime.now() - join_time).total_seconds())
 
-            # --- B. KẾT THÚC SESSION ---
-            # (Hàm này trả về None nếu duration < 60s và bị xóa)
             updated_session = database.end_session(session_id)
 
-            # --- C. XỬ LÝ LOGIC VÀ GỬI THÔNG BÁO ---
-
-            # === TRƯỜNG HỢP 1: SESSION HỢP LỆ (Đủ dài) ===
             if updated_session:
                 current_duration = updated_session['work_duration']
                 is_verified = updated_session['is_verified']
-
-                # Lấy tổng thời gian cộng dồn cho Task này
                 total_duration = database.get_accumulated_duration(user_id, task_id)
                 min_work_seconds = database.get_setting("min_work_seconds")
 
-                # >>> LOGIC MỚI: TỰ ĐỘNG TẠO CODE (AUTO-GENERATE) <<<
+                # Auto-Generate Code Logic
                 generated_code = None
                 code_msg = ""
-
-                # Nếu (Đủ thời gian) VÀ (Chưa Verify) -> Tự động xử lý Code
                 if total_duration >= min_work_seconds and not is_verified:
-
-                    # Kiểm tra xem đã có code cũ chưa?
-                    if database.has_active_submission(session_id):
+                    if database.check_submission_exists(session_id):
                         generated_code = database.get_submission_code(session_id)
-                        code_msg = f"Code cũ của bạn: `{generated_code}`"
+                        code_msg = f"Code cũ: `{generated_code}`"
                     else:
-                        # CHƯA CÓ -> TẠO MỚI LUÔN
                         new_code = secrets.token_hex(3).upper()
                         database.create_submission(session_id, user_id, task_id, new_code)
                         generated_code = new_code
                         code_msg = f"✅ **AUTO-GENERATED:** `{new_code}`"
 
-                # >>> XÁC ĐỊNH TRẠNG THÁI <<<
+                # Status Logic
                 status_msg = "❌ Session Invalid"
                 if total_duration >= min_work_seconds:
                     if is_verified:
                         status_msg = "✅ Attendance COUNTED"
                         database.update_session_counted_status(session_id, True)
                     else:
-                        status_msg = "⚠️ Đủ thời gian - Đang chờ Verify"
+                        status_msg = "⚠️ Đủ thời gian - Chờ Verify"
                 else:
-                    status_msg = "⚠️ Chưa đủ thời gian làm việc"
+                    status_msg = "⚠️ Chưa đủ thời gian"
 
-                # >>> TẠO EMBED <<<
+                # Create Embed
                 embed = discord.Embed()
                 if is_leaving:
                     embed.title = "🛑 Work Session Ended"
@@ -215,48 +185,23 @@ async def on_voice_state_update(member, before, after):
                     embed.description = "Dừng tính giờ (Deafen/Mute)."
                     embed.color = discord.Color.red()
 
+                embed.set_author(name=username, icon_url=avatar_url)
                 embed.add_field(name="Phiên này", value=str(timedelta(seconds=current_duration)), inline=True)
                 embed.add_field(name="Tổng cộng dồn", value=f"**{str(timedelta(seconds=total_duration))}**",
                                 inline=True)
                 embed.add_field(name="Trạng thái", value=status_msg, inline=False)
 
-                # Nếu có Code (Tự tạo hoặc Cũ) -> Hiển thị luôn
                 if generated_code:
                     embed.add_field(name="🔐 VERIFY CODE", value=code_msg, inline=False)
                     embed.set_footer(text=f"Gửi code này cho Boss: /verify {generated_code}")
-                elif total_duration < min_work_seconds:
-                    embed.set_footer(text=f"Cần làm thêm để nhận Code (Min: {min_work_seconds}s)")
 
-            # === TRƯỜNG HỢP 2: SESSION BỊ XÓA (Quá ngắn) ===
-            else:
-                # Sử dụng thời gian tạm tính (provisional_duration)
-                current_duration_str = str(timedelta(seconds=provisional_duration))
+                await send_to_log_channel(guild, content=f"<@{user_id}>", embed=embed)
 
-                embed = discord.Embed()
-                if is_leaving:
-                    embed.title = "🛑 Work Session Ended"
-                    embed.color = discord.Color.orange()
-                else:
-                    embed.title = "⏸️ Session Paused"
-                    embed.color = discord.Color.red()
-
-                embed.add_field(name="Duration", value=current_duration_str, inline=True)
-                embed.add_field(name="Verified", value="No", inline=True)
-                embed.add_field(name="Status", value="⚠️ Time too short (Deleted)", inline=False)
-                embed.set_footer(text="Session dưới 1 phút không được ghi nhận.")
-
-            # Gửi DM
-            try:
-                await member.send(embed=embed)
-            except discord.Forbidden:
-                pass
-
-        # Nếu là leaving hoặc mute thì xong việc, return luôn
         if is_leaving or (is_staying and (after.self_deaf or after.self_mute)):
             return
 
     # =========================================================
-    # 2. XỬ LÝ BẮT ĐẦU SESSION (Vào phòng HOẶC Bật lại tai nghe)
+    # 2. XỬ LÝ BẮT ĐẦU SESSION (Đã cập nhật Logic Google Sheet)
     # =========================================================
     should_start = (is_joining and not (after.self_deaf or after.self_mute)) or \
                    (is_staying and (before.self_deaf or before.self_mute) and not (after.self_deaf or after.self_mute))
@@ -265,237 +210,237 @@ async def on_voice_state_update(member, before, after):
         if database.get_active_session(user_id):
             return
 
+        # Đảm bảo user tồn tại trong DB
         database.get_or_create_user(user_id, username, avatar_url)
 
-        # --- LOGIC RESUME TASK ---
-        task_id = database.get_recent_task_id(user_id, minutes_threshold=15)
+        # --- LOGIC TÌM TASK (GOOGLE SHEET -> RECENT -> RANDOM) ---
+        task_id = None
+        task_name = "Unknown Task"
+        task_desc = "..."
+        sheet_row_id = None  # Biến lưu dòng sheet
+        source_msg = ""  # Để hiển thị nguồn task
 
-        if task_id:
-            task_data = database.fetch_one("SELECT * FROM tasks WHERE task_id = %s", (task_id,))
-            task_name = task_data['task_name'] + " (Resumed)"
-            task_desc = task_data['task_description']
-        else:
+        # 1. Xác định Role từ Mapping
+        user_role = USER_MAPPING.get(user_id)
+
+        # 2. Ưu tiên 1: Tìm trên Google Sheet
+        if user_role:
+            print(f"🔍 Checking Google Sheet for {username} ({user_role})...")
+            sheet_task = google_utils.get_assigned_task_from_sheet(user_role)
+
+            if sheet_task:
+                # Tìm thấy task trên Sheet!
+                sheet_task_name = f"[{sheet_task['task_code']}] {sheet_task['task_name']}"
+                sheet_desc = "Task synced from Google Sheet"
+                sheet_row_id = sheet_task['row_index']
+
+                # Đồng bộ vào DB Tasks để lấy ID
+                task_id = database.get_or_create_task(sheet_task_name, sheet_desc)
+                task_name = sheet_task_name
+                task_desc = sheet_desc
+                source_msg = "📊 Google Sheet"
+            else:
+                print(f"⚠️ No active task found on Sheet for {user_role}")
+
+        # 3. Ưu tiên 2: Nếu không có trên Sheet, tìm Task cũ (Resume)
+        if not task_id:
+            task_id = database.get_recent_task_id(user_id, minutes_threshold=15)
+            if task_id:
+                task_data = database.fetch_one("SELECT * FROM tasks WHERE task_id = %s", (task_id,))
+                if task_data:
+                    task_name = task_data['task_name'] + " (Resumed)"
+                    task_desc = task_data['task_description']
+                    source_msg = "🔄 Resumed Previous"
+
+        # 4. Ưu tiên 3: Random Task (Fallback cuối cùng)
+        if not task_id:
             task_data = database.get_random_active_task()
-            task_id = task_data['task_id'] if task_data else None
-            task_name = task_data['task_name'] if task_data else "No active tasks"
-            task_desc = task_data['task_description'] if task_data else "..."
+            if task_data:
+                task_id = task_data['task_id']
+                task_name = task_data['task_name']
+                task_desc = task_data['task_description']
+                source_msg = "🎲 Random Assigned"
+            else:
+                task_name = "No active tasks available"
+                task_desc = "Please contact admin."
+                source_msg = "⚠️ System"
 
-        database.start_session(
-            user_id=user_id,
-            task_id=task_id,
-            guild_id=member.guild.id,
-            voice_channel_id=after.channel.id
-        )
+        # 5. Tạo Session (Lưu kèm sheet_row_id nếu có)
+        # Lưu ý: Cần cập nhật hàm start_session trong database.py để nhận sheet_row_id
+        database.start_session(user_id, task_id, guild.id, after.channel.id, sheet_row_id)
 
-        total_duration = database.get_accumulated_duration(user_id, task_id)
-        total_duration_str = str(timedelta(seconds=total_duration))
+        # Lấy tổng thời gian để hiển thị
+        total_duration = 0
+        if task_id:
+            total_duration = database.get_accumulated_duration(user_id, task_id)
 
+        # Gửi thông báo Start
         embed = discord.Embed(title="🚀 Work Session Started", color=discord.Color.green())
         if is_staying:
-            embed.description = "Bạn đã bật lại tai nghe. Tiếp tục tính giờ!"
+            embed.description = "Đã bật lại tai nghe. Tiếp tục tính giờ!"
 
+        embed.set_author(name=username, icon_url=avatar_url)
         embed.add_field(name="Channel", value=after.channel.name, inline=False)
         embed.add_field(name="Task", value=f"**{task_name}**", inline=False)
-        embed.add_field(name="Task Description", value=task_desc, inline=False)
-        embed.add_field(name="Total Task Time", value=f"**{total_duration_str}**", inline=False)
+        embed.add_field(name="Source", value=f"`{source_msg}`", inline=True)
+        if sheet_row_id:
+            embed.add_field(name="Sheet Row", value=f"Row #{sheet_row_id}", inline=True)
 
-        try:
-            await member.send(embed=embed)
-        except discord.Forbidden:
-            print(f"Cannot DM {username}")
+        embed.add_field(name="Đã làm hôm nay", value=str(timedelta(seconds=total_duration)), inline=False)
+
+        await send_to_log_channel(guild, content=f"<@{user_id}> Chúc bạn làm việc hiệu quả! 💪", embed=embed)
 
 
-# --- Slash Command: /done (ĐÃ CẬP NHẬT LOGIC TÌM SESSION) ---
-@bot.tree.command(name="done", description="Submit your assigned task as complete.")
+# --- Slash Command: /done ---
+@bot.tree.command(name="done", description="Báo cáo hoàn thành task.")
 async def done(interaction: discord.Interaction):
-    """
-    User submits their task. Bot generates a code.
-    MỚI: Cho phép /done cho session vừa kết thúc (trong vòng 15 phút).
-    """
     user_id = interaction.user.id
 
-    # 1. Check for Active OR Recently Ended Session
-    # *** Cần định nghĩa database.get_active_or_recent_session(user_id) ***
-    # Đây là logic SQL bạn đã cung cấp, nhưng được đặt trong database.py:
-    # SELECT * FROM work_sessions
-    # WHERE user_id = %s
-    # AND (leave_time IS NULL OR leave_time > NOW() - INTERVAL 15 MINUTE)
-    # ORDER BY session_id DESC LIMIT 1
+    # (Logic kiểm tra session - Giữ nguyên)
     session = database.get_active_or_recent_session(user_id)
-
-    # 1.1. Báo lỗi nếu không tìm thấy session hợp lệ
     if not session:
-        await interaction.response.send_message(
-            "❌ Bạn không có session làm việc đang hoạt động, hoặc session cuối cùng đã kết thúc quá 15 phút. \n"
-            "Vui lòng vào lại Voice Channel để bắt đầu session mới.",
-            ephemeral=True
-        )
+        await interaction.response.send_message("❌ Bạn không có session làm việc nào gần đây.", ephemeral=True)
         return
 
-    # 1.2. Kiểm tra xem session đã có submission chưa (ngăn spam /done)
-    if database.has_active_submission(session['session_id']):
-        await interaction.response.send_message(
-            f"⚠️ Bạn đã gõ /done cho session này rồi. Code hiện tại là: `{database.get_submission_code(session['session_id'])}`",
-            ephemeral=True
-        )
+    if database.check_submission_exists(session['session_id']):
+        code = database.get_submission_code(session['session_id'])
+        await interaction.response.send_message(f"⚠️ Đã có code rồi: `{code}`", ephemeral=True)
         return
 
-    # 1.3. Kiểm tra Task Assignment (Logic giữ nguyên)
     if not session['task_id']:
-        await interaction.response.send_message("⚠️ Bạn không có Assigned Task cho session này.", ephemeral=True)
+        await interaction.response.send_message("⚠️ Không có task.", ephemeral=True)
         return
 
-    # 2. Generate Secure Code (Logic giữ nguyên)
     verify_code = secrets.token_hex(3).upper()
+    database.create_submission(session['session_id'], user_id, session['task_id'], verify_code)
 
-    # 3. Save Submission to DB (Logic giữ nguyên)
-    database.create_submission(
-        session_id=session['session_id'],
-        user_id=user_id,
-        task_id=session['task_id'],
-        verify_code=verify_code
-    )
-
-    # 4. Respond to User (Logic giữ nguyên)
-    # Cần lấy Task Name lại nếu session đã kết thúc (vì nó không còn là active session nữa)
-    # Nếu DB có lưu Task Name trong session, thì dùng luôn. Nếu không:
     task_data = database.get_task_by_id(session['task_id'])
     task_name = task_data['task_name'] if task_data else "Unknown Task"
 
-    embed = discord.Embed(title="📝 Task Submitted", color=discord.Color.blue())
-    embed.description = f"Vui lòng gửi code này cho Boss/Manager để verify công việc của bạn."
-    embed.add_field(name="Task", value=task_name)
-    embed.add_field(name="🔐 Verification Code", value=f"`{verify_code}`")
-    embed.set_footer(text="Boss uses: /verify <code>")
+    # 1. Phản hồi Ephemeral (Riêng tư) cho User biết là lệnh đã chạy
+    embed_private = discord.Embed(title="✅ Đã nộp Task!", color=discord.Color.blue())
+    embed_private.add_field(name="Code", value=f"`{verify_code}`")
+    embed_private.set_footer(text="Bot đã gửi ảnh reward vào kênh chat chung!")
+    await interaction.response.send_message(embed=embed_private, ephemeral=True)
 
-    await interaction.response.send_message(embed=embed, ephemeral=True)
-
-    # ---------------------------------------------------------
-    # [TÍNH NĂNG MỚI] GỬI REWARD IMAGE VÀO DM
-    # ---------------------------------------------------------
-
-    # 1. Lấy đường dẫn ảnh
+    # 2. Gửi Reward + Thông báo công khai vào LOG CHANNEL
     image_path = get_random_reward_file()
 
+    embed_public = discord.Embed(title="🎉 Task Completed!", color=discord.Color.gold())
+    embed_public.set_author(name=interaction.user.name,
+                            icon_url=interaction.user.avatar.url if interaction.user.avatar else None)
+    embed_public.description = f"<@{user_id}> vừa hoàn thành task **{task_name}**!"
+    embed_public.add_field(name="🔐 Verify Code", value=f"`{verify_code}` (Boss verify giúp em nhé)")
+
+    file = None
     if image_path:
-        try:
-            # 2. Tạo đối tượng File của Discord
-            file = discord.File(image_path)
+        file = discord.File(image_path)
+        embed_public.set_image(url=f"attachment://{os.path.basename(image_path)}")
 
-            # 3. Tạo Embed chúc mừng (Optional)
-            reward_embed = discord.Embed(
-                title="🎉 Good Job!",
-                description="Cảm ơn bạn đã hoàn thành công việc! Đây là phần thưởng tinh thần cho bạn.",
-                color=discord.Color.gold()
-            )
-            # Đặt ảnh vào trong embed (hoặc gửi rời cũng được)
-            reward_embed.set_image(url=f"attachment://{os.path.basename(image_path)}")
-
-            # 4. Gửi thẳng vào DM của User
-            await interaction.user.send(embed=reward_embed, file=file)
-            print(f"Sent reward {os.path.basename(image_path)} to {interaction.user.name}")
-
-        except discord.Forbidden:
-            # User chặn DM
-            print(f"Cannot send reward DM to {interaction.user.name}")
-        except Exception as e:
-            print(f"Error sending reward image: {e}")
+    await send_to_log_channel(interaction.guild, content=f"<@{user_id}> Giỏi quá! 🎁", embed=embed_public, file=file)
 
 
-# --- Slash Command: /verify (ĐÃ CẬP NHẬT) ---
-@bot.tree.command(name="verify", description="[BOSS ONLY] Verify a user's task code.")
-@app_commands.describe(code="The 6-character verification code")
+# --- Slash Command: /verify ---
+@bot.tree.command(name="verify", description="[BOSS] Duyệt task.")
 async def verify(interaction: discord.Interaction, code: str):
-    """
-    Boss verifies a code.
-    """
-    # OPTIONAL: Add logic here to check if interaction.user has a specific 'Boss' role.
-    # ... (Permission Check - Giữ nguyên)
-
     code = code.strip().upper()
     boss_id = interaction.user.id
 
-    # 1. Find Submission
     submission = database.get_submission_by_code(code)
-
     if not submission:
-        await interaction.response.send_message("❌ Invalid or already verified code.", ephemeral=True)
+        await interaction.response.send_message("❌ Code không đúng hoặc đã duyệt.", ephemeral=True)
         return
 
     session_id = submission['session_id']
     worker_id = submission['user_id']
 
-    # 2. Mark as Verified in DB (both tables)
     database.verify_submission(submission['submission_id'], boss_id)
     database.update_session_verification(session_id, True)
 
-    # 3. Thông báo ban đầu cho Boss (để tránh lỗi timeout)
-    await interaction.response.send_message(f"✅ Code verified for <@{worker_id}>! Checking attendance status...",
-                                            ephemeral=False)
-
-    # 4. [NEW] RE-CHECK ATTENDANCE (Hồi tố)
-
-    # Lấy thông tin session để xem nó đã kết thúc chưa
+    # Hồi tố (Re-check attendance)
     session_info = database.fetch_one("SELECT * FROM work_sessions WHERE session_id = %s", (session_id,))
+    msg_extra = ""
+    if session_info and session_info['leave_time']:
+        duration = session_info['work_duration']
+        min_work = database.get_setting("min_work_seconds")
 
-    if session_info:
-        # Lấy thông tin cần thiết
-        leave_time = session_info.get('leave_time')
-        duration = session_info.get('work_duration', 0)  # Dùng .get để an toàn
+        # Kiểm tra tổng thời gian cộng dồn task
+        total_duration = database.get_accumulated_duration(worker_id, session_info['task_id'])
 
-        # Kiểm tra xem session đã kết thúc chưa (leave_time IS NOT NULL)
-        if leave_time is not None:
-            # Session đã kết thúc, giờ kiểm tra lại thời gian xem đủ chưa
-            min_work = database.get_setting("min_work_seconds")
-
-            # Logic: Đủ thời gian VÀ đã verify (luôn đúng vì vừa verify ở trên)
-            if duration >= min_work:
-                # CẬP NHẬT LẠI TRẠNG THÁI COUNTED
-                database.update_session_counted_status(session_id, True)
-
-                # Format duration để hiển thị đẹp hơn
-                duration_str = str(timedelta(seconds=duration))
-
-                # Gửi follow-up (cập nhật thông báo ban đầu)
-                await interaction.followup.send(
-                    f"✅ Session đã được verified và kết thúc. Thời gian làm việc: **{duration_str}**. **Attendance COUNTED!**"
-                )
-            else:
-                # Gửi follow-up
-                await interaction.followup.send(
-                    f"✅ Session đã được verified nhưng thời gian làm việc ({duration}s) quá ngắn. Not counted."
-                )
+        if total_duration >= min_work:
+            database.update_session_counted_status(session_id, True)
+            msg_extra = f"⏱️ Tổng thời gian: {timedelta(seconds=total_duration)}. **Attendance COUNTED!**"
         else:
-            # Session vẫn đang chạy, chỉ xác nhận verify
-            await interaction.followup.send(
-                f"✅ Verified! User <@{worker_id}> is still working. Attendance will be calculated when they leave.",
-                ephemeral=True
-            )
-    else:
-        # Lỗi: Không tìm thấy session
-        await interaction.followup.send("❌ Error: Could not find session information.", ephemeral=True)
+            msg_extra = f"⚠️ Tổng thời gian: {timedelta(seconds=total_duration)} (Chưa đủ {min_work}s)."
 
+    # Thông báo công khai vào Log Channel
+    embed = discord.Embed(title="✅ Task Verified", color=discord.Color.green())
+    embed.description = f"Sếp <@{boss_id}> đã duyệt bài cho <@{worker_id}>.\nCode: `{code}`"
+    if msg_extra:
+        embed.add_field(name="Kết quả chấm công", value=msg_extra, inline=False)
+
+    await interaction.response.send_message("Đã duyệt!", ephemeral=True)  # Phản hồi cho Boss biết
+    await send_to_log_channel(interaction.guild, content=f"<@{worker_id}>", embed=embed)
 
 
 # --- Slash Command: /status ---
-@bot.tree.command(name="status", description="Check your current session status.")
+@bot.tree.command(name="status", description="Xem trạng thái làm việc hiện tại.")
 async def status(interaction: discord.Interaction):
     session = database.get_active_session(interaction.user.id)
-
     if not session:
-        await interaction.response.send_message("💤 You are not currently working.", ephemeral=True)
+        await interaction.response.send_message("💤 Bạn đang không trong phiên làm việc nào.", ephemeral=True)
     else:
-        join_time = session['join_time']
         task_name = session['task_name']
-        embed = discord.Embed(title="Currently Working 👨‍💻", color=discord.Color.green())
+        total_duration = database.get_accumulated_duration(interaction.user.id, session['task_id'])
+        embed = discord.Embed(title="👨‍💻 Đang làm việc", color=discord.Color.green())
         embed.add_field(name="Task", value=task_name)
-        embed.add_field(name="Started At", value=discord.utils.format_dt(join_time, style='R'))
+        embed.add_field(name="Tổng thời gian hôm nay", value=str(timedelta(seconds=total_duration)))
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-# --- Run the Bot ---
+# --- Slash Command: /help ---
+@bot.tree.command(name="help", description="Hướng dẫn sử dụng Bot chấm công.")
+async def help(interaction: discord.Interaction):
+    """
+    Hiển thị hướng dẫn sử dụng.
+    """
+    embed = discord.Embed(title="📖 Hướng dẫn sử dụng Attendance Bot", color=discord.Color.purple())
+
+    # Kênh Voice
+    target_channel = f"<#{TARGET_VC_ID}>" if TARGET_VC_ID else "kênh Voice quy định"
+    min_time = timedelta(seconds=database.get_setting("min_work_seconds"))
+
+    embed.description = f"Bot tự động chấm công khi bạn tham gia {target_channel}."
+
+    embed.add_field(
+        name="1️⃣ Bắt đầu làm việc",
+        value=f"- Tham gia {target_channel}.\n- Bot sẽ tự động DM/Tag bạn và giao Task.\n- **Lưu ý:** Không tắt tai nghe (Deafen) quá lâu.",
+        inline=False
+    )
+
+    embed.add_field(
+        name="2️⃣ Báo cáo (Quan trọng)",
+        value="- Khi làm xong (hoặc đủ thời gian), gõ lệnh `/done`.\n- Bot sẽ gửi ảnh Reward và **Code xác nhận**.",
+        inline=False
+    )
+
+    embed.add_field(
+        name="3️⃣ Xác nhận & Tính công",
+        value=f"- Gửi Code xác nhận cho Sếp.\n- Sếp gõ `/verify <CODE>`.\n- Nếu tổng thời gian > **{min_time}** VÀ đã Verify -> **Được tính công**.",
+        inline=False
+    )
+
+    embed.add_field(
+        name="🛠️ Các lệnh khác",
+        value="`/status`: Xem mình đang làm gì, bao lâu.\n`/help`: Xem bảng này.",
+        inline=False
+    )
+
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
 if __name__ == "__main__":
     if not TOKEN:
-        print("Error: DISCORD_TOKEN not found in .env file.")
+        print("Error: DISCORD_TOKEN not found.")
     else:
         bot.run(TOKEN)
