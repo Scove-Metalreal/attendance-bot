@@ -127,24 +127,83 @@ def get_active_session(user_id: int):
     return fetch_one(sql, (user_id,))
 
 
+# TƯƠNG ĐƯƠNG VỚI HÀM get_active_or_recent_session(user_id)
+def get_active_or_recent_session(user_id: int):
+    sql = """
+          SELECT ws.*, t.task_name \
+          FROM work_sessions ws \
+                   LEFT JOIN tasks t ON ws.task_id = t.task_id
+          WHERE ws.user_id = %s
+            AND (
+              ws.leave_time IS NULL
+                  OR ws.leave_time > NOW() - INTERVAL 15 MINUTE
+              )
+          ORDER BY ws.session_id DESC LIMIT 1 \
+          """
+    return fetch_one(sql, (user_id,))
+
+
+def has_active_submission(session_id: int):
+    # Trả về True nếu tồn tại submission chưa verify
+    sql = "SELECT 1 FROM task_submissions WHERE session_id = %s AND is_verified = 0 LIMIT 1"
+    return fetch_one(sql, (session_id,)) is not None
+
+
+def get_submission_code(session_id: int):
+    # Lấy code cuối cùng của session
+    sql = "SELECT verify_code FROM task_submissions WHERE session_id = %s ORDER BY submission_id DESC LIMIT 1"
+    res = fetch_one(sql, (session_id,))
+    return res['verify_code'] if res else "N/A"
+
+
+def get_task_by_id(task_id: int):
+    # Lấy thông tin task
+    return fetch_one("SELECT task_name FROM tasks WHERE task_id = %s", (task_id,))
+
 def end_session(session_id: int):
     """
     Updates a work session with the leave_time and calculates work_duration.
-    Returns the updated session data or None on failure.
+    If the duration is too short (< 60s), it deletes the session and its submissions.
+    Returns the updated session data or None if deleted/failure.
     """
     # 1. Update leave_time and calculate work_duration
     sql_update = """
                  UPDATE work_sessions
                  SET leave_time    = NOW(),
                      work_duration = TIMESTAMPDIFF(SECOND, join_time, NOW())
-                 WHERE session_id = %s \
+                 WHERE session_id = %s
                  """
     if not execute_query(sql_update, (session_id,)):
         return None
 
-    # 2. Fetch the complete updated session data
-    sql_fetch = "SELECT * FROM work_sessions WHERE session_id = %s"
-    return fetch_one(sql_fetch, (session_id,))
+    # 2. Fetch the complete updated session data to get the calculated duration
+    updated_session = fetch_one("SELECT * FROM work_sessions WHERE session_id = %s", (session_id,))
+
+    if not updated_session:
+        return None
+
+    # 3. [NEW LOGIC] KIỂM TRA DURATION VÀ XÓA SESSION RÁC (Garbage Collection)
+
+    # Đặt ngưỡng tối thiểu để tránh spam/chập chờn. Ví dụ: 60 giây.
+    # Nên dùng một setting để dễ dàng thay đổi mà không cần sửa code.
+    min_duration_to_keep = 5  # Hoặc database.get_setting("min_session_duration")
+
+    duration = updated_session['work_duration']
+
+    if duration < min_duration_to_keep:
+        print(f"🗑️ Deleting short session {session_id}. Duration: {duration}s")
+
+        # Xóa các submission liên quan (Nếu có)
+        execute_query("DELETE FROM task_submissions WHERE session_id = %s", (session_id,))
+
+        # Xóa session chính
+        execute_query("DELETE FROM work_sessions WHERE session_id = %s", (session_id,))
+
+        # Trả về None để Bot Event biết và KHÔNG gửi thông báo kết thúc session
+        return None
+
+        # 4. Trả về session hợp lệ nếu nó đủ dài
+    return updated_session
 
 
 def update_session_verification(session_id: int, is_verified: bool):
@@ -187,13 +246,47 @@ def verify_submission(submission_id: int, boss_id: int):
     """Marks a submission as verified and records the verifier ID and time."""
     sql = """
           UPDATE task_submissions
-          SET verified    = TRUE, \g
+          SET verified    = TRUE, \
               verified_by = %s, \
               verified_at = NOW()
           WHERE submission_id = %s \
             AND verified = FALSE \
           """
     return execute_query(sql, (boss_id, submission_id))
+
+# --- THÊM VÀO CUỐI FILE database.py ---
+
+def get_recent_task_id(user_id: int, minutes_threshold=15):
+    """
+    Lấy task_id của phiên làm việc gần nhất (trong vòng X phút).
+    Giúp user tiếp tục task cũ nếu lỡ bị disconnect hoặc deafen.
+    """
+    sql = """
+    SELECT task_id FROM work_sessions 
+    WHERE user_id = %s 
+    AND leave_time > NOW() - INTERVAL %s MINUTE
+    ORDER BY session_id DESC LIMIT 1
+    """
+    res = fetch_one(sql, (user_id, minutes_threshold))
+    return res['task_id'] if res else None
+
+def get_accumulated_duration(user_id: int, task_id: int):
+    """
+    Tính TỔNG thời gian user đã làm cho một Task cụ thể trong 24h qua
+    (Bao gồm cả các session bị ngắt quãng do deafen/mute).
+    Chỉ tính các session chưa được trả công (is_counted = 0).
+    """
+    sql = """
+    SELECT SUM(work_duration) as total_seconds
+    FROM work_sessions
+    WHERE user_id = %s 
+    AND task_id = %s
+    AND join_time > NOW() - INTERVAL 24 HOUR
+    AND is_counted = 0
+    """
+    res = fetch_one(sql, (user_id, task_id))
+    # Nếu res['total_seconds'] là None (chưa làm gì) thì trả về 0
+    return int(res['total_seconds']) if res and res['total_seconds'] else 0
 
 
 # --- Example Usage (Optional - for testing the module) ---

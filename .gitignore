@@ -36,3 +36,6 @@ Thumbs.db             # Windows
 # 6. Deployment Artifacts (If using Docker/other deployment tools)
 # If you eventually deploy using Docker or other tools, these are often excluded
 .dockerignore
+
+reward_images/
+
