@@ -1,0 +1,38 @@
+# ----------------------------------------------------------------------
+# Discord Attendance Bot .gitignore
+# ----------------------------------------------------------------------
+
+# 1. Environment and Sensitive Files (CRITICAL!)
+# DO NOT commit your Discord token, DB passwords, or local configuration.
+.env
+
+# 2. Python Virtual Environment
+# Exclude the virtual environment directory
+venv/
+*.pyc
+
+# 3. Discord.py, MySQL, and Python Cache/Build Files
+# Exclude Python compiled files
+__pycache__/
+*.pyd
+
+# Exclude package distribution files
+dist/
+build/
+*.egg-info/
+
+# 4. OS and Editor Files
+# Exclude common operating system and editor temporary files
+.DS_Store             # macOS
+Thumbs.db             # Windows
+.vscode/              # Visual Studio Code settings (optional, but often excluded)
+*.swp                 # Vim swap files
+
+# 5. Database Logs and Local Dumps (If any)
+# Exclude any local database logs or dumps you might create
+*.log
+*.sql.dump
+
+# 6. Deployment Artifacts (If using Docker/other deployment tools)
+# If you eventually deploy using Docker or other tools, these are often excluded
+.dockerignore
