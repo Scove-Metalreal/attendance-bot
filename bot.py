@@ -6,7 +6,7 @@ import secrets
 from dotenv import load_dotenv
 from datetime import timedelta, datetime
 import random
-import google_utils
+# import google_utils
 
 # Import our custom database module
 import database
@@ -204,7 +204,7 @@ async def on_voice_state_update(member, before, after):
     # 2. XỬ LÝ BẮT ĐẦU SESSION (Đã cập nhật Logic Google Sheet)
     # =========================================================
     should_start = (is_joining and not (after.self_deaf or after.self_mute)) or \
-                   (is_staying and (before.self_deaf or before.self_mute) and not (after.self_deaf or after.self_mute))
+                (is_staying and (before.self_deaf or before.self_mute) and not (after.self_deaf or after.self_mute))
 
     if should_start:
         if database.get_active_session(user_id):
