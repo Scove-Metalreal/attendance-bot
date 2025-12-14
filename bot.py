@@ -22,9 +22,9 @@ LEADERS = [123456789012345678]  # Add leader Discord IDs
 # USER ROLE MAPPING (Discord ID -> Role in Sheet)
 USER_ROLE_MAPPING = {
     1025600433722499152: "Project Lead",
-    987654321098765432: "Tech Lead",
-    111111111111111111: "Level Builder/QA",
-    222222222222222222: "Gameplay Prog",
+    774590488811405372: "Tech Lead",
+    1409363976386515015: "Level Builder/QA",
+    939678863745757304: "Gameplay Prog",
     # Add more mappings here
 }
 
